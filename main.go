@@ -82,6 +82,8 @@ func runServer(c *cli.Context) {
 		rp = &reverseproxy.FastReverseProxy{}
 	case "sni":
 		rp = &reverseproxy.SNIReverseProxy{}
+	case "forwardproxy":
+		rp = &reverseproxy.ForwardProxy{}
 	default:
 		log.Fatal(errors.New("invalid engine"))
 	}
@@ -357,7 +359,7 @@ The value 'none' can be used to disable access logs.`,
 		cli.StringFlag{
 			Name:  "engine",
 			Value: "native",
-			Usage: "Reverse proxy engine, options are 'native', 'sni' and 'fasthttp'. Using 'sni' and 'fasthttp' is highly experimental and not recommended for production environments.",
+			Usage: "Reverse proxy engine, options are 'native', 'sni', 'fasthttp' and 'forwardproxy'. Using 'sni', 'fasthttp' and 'forwardproxy' is highly experimental and not recommended for production environments.",
 		},
 		cli.BoolFlag{
 			Name:  "backend-cache",
