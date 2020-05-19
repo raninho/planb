@@ -3,11 +3,13 @@ package reverseproxy
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
 	uuid "github.com/nu7hatch/gouuid"
@@ -84,11 +86,13 @@ func (fp *ForwardProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 	req.Header["Planb-X-Forwarded-For"] = req.Header["X-Forwarded-For"]
+	req.Header["Planb-X-Preference-Proxy"] = req.Header["Proxy-Authorization"]
 	fp.rp.ServeHTTP(rw, req)
 }
 
 func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
-	reqData, err := fp.Router.ChooseBackend(req.Host)
+	preference := getPreferenceProviderName(req.Header.Get("Planb-X-Preference-Proxy"))
+	reqData, err := fp.Router.ChooseBackendForProxy(req.Host, preference )
 	if err != nil {
 		fmt.Errorf("error in ChooseBackend: %s", err)
 		return nil, err
@@ -105,4 +109,21 @@ func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	return rsp, nil
+}
+
+func getPreferenceProviderName(auth string) (preferenceProvider string) {
+	const prefix = "Basic "
+	if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return
+	}
+	c, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	if err != nil {
+		return
+	}
+	cs := string(c)
+	s := strings.IndexByte(cs, ':')
+	if s < 0 {
+		return
+	}
+	return cs[s+1:]
 }
