@@ -91,13 +91,23 @@ func (fp *ForwardProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
+	for _, cookie := range req.Cookies() {
+		if cookie.Name == "planb" {
+			return fp.Send(req, cookie.Value)
+		}
+	}
+
 	preference := getPreferenceProviderName(req.Header.Get("Planb-X-Preference-Proxy"))
 	reqData, err := fp.ChooseBackend(req.Host, preference )
 	if err != nil {
 		fmt.Errorf("error in ChooseBackend: %s", err)
 		return nil, err
 	}
-	u, err := url.Parse(reqData.Backend)
+	return fp.Send(req, reqData.Backend)
+}
+
+func (fp *ForwardProxy) Send(req *http.Request, backend string) (*http.Response, error) {
+	u, err := url.Parse(backend)
 	if err != nil {
 		fmt.Errorf("error in url.Parse: %s", err)
 		return nil, err
@@ -108,6 +118,8 @@ func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		fmt.Errorf("error in RoundTrip: %s", err)
 		return nil, err
 	}
+	cookie := http.Cookie{Name: "planb", Value: u.String(), Expires: time.Now().Add(5 * time.Minute)}
+	rsp.Header.Add("Set-Cookie", cookie.String())
 	return rsp, nil
 }
 
