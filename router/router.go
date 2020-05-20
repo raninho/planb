@@ -188,24 +188,3 @@ func (router *Router) getBackends(host string) (*backendSet, error) {
 	return &set, nil
 }
 
-func (router *Router) ChooseBackendForProxy(host string, preferenceProvider string) (*reverseproxy.RequestData, error) {
-	if preferenceProvider != "" {
-		reqData, err := router.ChooseBackend(preferenceProvider)
-		if err == nil {
-			return reqData, nil
-		}
-	}
-
-	reqData, err := router.ChooseBackend("DEFAULT")
-	if err != nil {
-		return nil, err
-	}
-
-	reqData, err = router.ChooseBackend(reqData.Backend)
-	if err != nil {
-		return nil, err
-	}
-
-	return reqData, nil
-}
-

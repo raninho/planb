@@ -92,7 +92,7 @@ func (fp *ForwardProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	preference := getPreferenceProviderName(req.Header.Get("Planb-X-Preference-Proxy"))
-	reqData, err := fp.Router.ChooseBackendForProxy(req.Host, preference )
+	reqData, err := fp.ChooseBackend(req.Host, preference )
 	if err != nil {
 		fmt.Errorf("error in ChooseBackend: %s", err)
 		return nil, err
@@ -109,6 +109,27 @@ func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	return rsp, nil
+}
+
+func (fp *ForwardProxy) ChooseBackend(host string, preferenceProvider string) (*RequestData, error) {
+	if preferenceProvider != "" {
+		reqData, err := fp.Router.ChooseBackend(preferenceProvider)
+		if err == nil {
+			return reqData, nil
+		}
+	}
+
+	reqData, err := fp.Router.ChooseBackend("DEFAULT")
+	if err != nil {
+		return nil, err
+	}
+
+	reqData, err = fp.Router.ChooseBackend(reqData.Backend)
+	if err != nil {
+		return nil, err
+	}
+
+	return reqData, nil
 }
 
 func getPreferenceProviderName(auth string) (preferenceProvider string) {
