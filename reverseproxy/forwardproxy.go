@@ -1,32 +1,186 @@
 package reverseproxy
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path"
 	"strings"
+	"sync"
 	"time"
 
 	uuid "github.com/nu7hatch/gouuid"
 )
 
+var (
+	hostname, _ = os.Hostname()
+
+	dir      = path.Join(os.Getenv("HOME"), ".mitm")
+	keyFile  = path.Join(dir, "ca-key.pem")
+	certFile = path.Join(dir, "ca-cert.pem")
+)
+
 type ForwardProxy struct {
 	http.Transport
 	ReverseProxyConfig
+	CA *tls.Certificate
 	servers []*http.Server
 	rp      *httputil.ReverseProxy
 	dialer  *net.Dialer
+	TLSServerConfig *tls.Config
+	TLSClientConfig *tls.Config
+	FlushInterval time.Duration
+	Wrap func(upstream http.Handler) http.Handler
 }
+
+func loadCA() (cert tls.Certificate, err error) {
+	// TODO(kr): check file permissions
+	cert, err = tls.LoadX509KeyPair(certFile, keyFile)
+	if os.IsNotExist(err) {
+		cert, err = genCA()
+	}
+	if err == nil {
+		cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+	}
+	return
+}
+
+func genCA() (cert tls.Certificate, err error) {
+	hostname, _ := os.Hostname()
+	err = os.MkdirAll(dir, 0700)
+	if err != nil {
+		return
+	}
+	certPEM, keyPEM, err := GenCA(hostname)
+	if err != nil {
+		return
+	}
+	cert, _ = tls.X509KeyPair(certPEM, keyPEM)
+	err = ioutil.WriteFile(certFile, certPEM, 0400)
+	if err == nil {
+		err = ioutil.WriteFile(keyFile, keyPEM, 0400)
+	}
+	return cert, err
+}
+
+func GenCA(name string) (certPEM, keyPEM []byte, err error) {
+	caMaxAge := 5 * 365 * 24 * time.Hour
+	caUsage := x509.KeyUsageDigitalSignature |
+		x509.KeyUsageContentCommitment |
+		x509.KeyUsageKeyEncipherment |
+		x509.KeyUsageDataEncipherment |
+		x509.KeyUsageKeyAgreement |
+		x509.KeyUsageCertSign |
+		x509.KeyUsageCRLSign
+	now := time.Now().UTC()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: name},
+		NotBefore:             now,
+		NotAfter:              now.Add(caMaxAge),
+		KeyUsage:              caUsage,
+		BasicConstraintsValid: true,
+		IsCA:               true,
+		MaxPathLen:         2,
+		SignatureAlgorithm: x509.ECDSAWithSHA512,
+	}
+	key, err := genKeyPair()
+	if err != nil {
+		return
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	if err != nil {
+		return
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})
+	keyPEM = pem.EncodeToMemory(&pem.Block{
+		Type:  "ECDSA PRIVATE KEY",
+		Bytes: keyDER,
+	})
+	return
+}
+
+type cloudToButtResponse struct {
+	http.ResponseWriter
+
+	sub         bool
+	wroteHeader bool
+}
+
+func (w *cloudToButtResponse) WriteHeader(code int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	ctype := w.Header().Get("Content-Type")
+	if strings.HasPrefix(ctype, "text/html") {
+		w.sub = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+var (
+	cloud = []byte("the cloud")
+	butt  = []byte("my   butt")
+)
+
+func (w *cloudToButtResponse) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(200)
+	}
+	if w.sub {
+		p = bytes.Replace(p, cloud, butt, -1)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func cloudToButt(upstream http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("Accept-Encoding", "")
+		upstream.ServeHTTP(&cloudToButtResponse{ResponseWriter: w}, r)
+	})
+}
+
 
 func (fp *ForwardProxy) Initialize(rpConfig ReverseProxyConfig) error {
 	fp.ReverseProxyConfig = rpConfig
 	fp.servers = make([]*http.Server, 0)
+
+	ca, err := loadCA()
+	if err!= nil {
+		return err
+	}
+
+	fp.CA = &ca
+	fp.TLSServerConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	fp.Wrap = cloudToButt
 
 	fp.dialer = &net.Dialer{
 		Timeout:   fp.DialTimeout,
@@ -168,7 +322,217 @@ func (fp *ForwardProxy) HandleTunneling4(w http.ResponseWriter, r *http.Request)
 	io.Copy(client_conn, resp.Body)
 }
 
+func dnsName(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+func genKeyPair() (*ecdsa.PrivateKey, error) {
+	return ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+}
+
+func genCert(ca *tls.Certificate, names []string) (*tls.Certificate, error) {
+	now := time.Now().Add(-1 * time.Hour).UTC()
+	if !ca.Leaf.IsCA {
+		return nil, errors.New("CA cert is not a CA")
+	}
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate serial number: %s", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serialNumber,
+		Subject:               pkix.Name{CommonName: names[0]},
+		NotBefore:             now,
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature |
+			x509.KeyUsageContentCommitment |
+			x509.KeyUsageKeyEncipherment |
+			x509.KeyUsageDataEncipherment |
+			x509.KeyUsageKeyAgreement |
+			x509.KeyUsageCertSign |
+			x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		DNSNames:              names,
+		SignatureAlgorithm:    x509.ECDSAWithSHA512,
+	}
+	key, err := genKeyPair()
+	if err != nil {
+		return nil, err
+	}
+	x, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Leaf, key.Public(), ca.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
+	cert := new(tls.Certificate)
+	cert.Certificate = append(cert.Certificate, x)
+	cert.PrivateKey = key
+	cert.Leaf, _ = x509.ParseCertificate(x)
+	return cert, nil
+}
+
+func handshake(w http.ResponseWriter, config *tls.Config) (net.Conn, error) {
+	var okHeader = []byte("HTTP/1.1 200 OK\r\n\r\n")
+
+	raw, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		http.Error(w, "no upstream", 503)
+		return nil, err
+	}
+	if _, err = raw.Write(okHeader); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	conn := tls.Server(raw, config)
+	err = conn.Handshake()
+	if err != nil {
+		conn.Close()
+		raw.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func httpDirector(r *http.Request) {
+	r.URL.Host = r.Host
+	r.URL.Scheme = "http"
+}
+
+func httpsDirector(r *http.Request) {
+	r.URL.Host = r.Host
+	r.URL.Scheme = "https"
+}
+
+// A oneShotDialer implements net.Dialer whos Dial only returns a
+// net.Conn as specified by c followed by an error for each subsequent Dial.
+type oneShotDialer struct {
+	c  net.Conn
+	mu sync.Mutex
+}
+
+func (d *oneShotDialer) Dial(network, addr string) (net.Conn, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.c == nil {
+		return nil, errors.New("closed")
+	}
+	c := d.c
+	d.c = nil
+	return c, nil
+}
+
 func (fp *ForwardProxy) HandleTunneling(w http.ResponseWriter, r *http.Request) {
+	var (
+		err   error
+		sconn *tls.Conn
+		name  = dnsName(r.Host)
+	)
+
+	if name == "" {
+		log.Println("cannot determine cert name for " + r.Host)
+		http.Error(w, "no upstream", 503)
+		return
+	}
+
+	provisionalCert, err := genCert(fp.CA, []string{name})
+	if err != nil {
+		log.Println("cert", err)
+		http.Error(w, "no upstream", 503)
+		return
+	}
+
+	sConfig := new(tls.Config)
+	if fp.TLSServerConfig != nil {
+		*sConfig = *fp.TLSServerConfig
+	}
+	sConfig.Certificates = []tls.Certificate{*provisionalCert}
+	sConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		cConfig := new(tls.Config)
+		if fp.TLSClientConfig != nil {
+			*cConfig = *fp.TLSClientConfig
+		}
+		cConfig.ServerName = hello.ServerName
+		sconn, err = tls.Dial("tcp", r.Host, cConfig)
+		if err != nil {
+			log.Println("dial", r.Host, err)
+			return nil, err
+		}
+		provisionalCert, err := genCert(fp.CA, []string{name})
+		if err != nil {
+			log.Println("cert", err)
+			http.Error(w, "no upstream", 503)
+			return nil, err
+		}
+		return provisionalCert, nil
+	}
+
+	cconn, err := handshake(w, sConfig)
+	if err != nil {
+		log.Println("handshake", r.Host, err)
+		return
+	}
+	defer cconn.Close()
+	if sconn == nil {
+		log.Println("could not determine cert name for " + r.Host)
+		return
+	}
+	defer sconn.Close()
+
+	//od := &oneShotDialer{c: sconn}
+	/*rp := &httputil.ReverseProxy{
+		Director:      httpsDirector,
+		Transport:     &http.Transport{DialTLS: od.Dial},
+		FlushInterval: fp.FlushInterval,
+	}*/
+
+	ch := make(chan int)
+	wc := &onCloseConn{cconn, func() { ch <- 0 }}
+	http.Serve(&oneShotListener{wc}, fp.Wrap(fp.rp))
+	<-ch
+}
+
+// A oneShotListener implements net.Listener whos Accept only returns a
+// net.Conn as specified by c followed by an error for each subsequent Accept.
+type oneShotListener struct {
+	c net.Conn
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	if l.c == nil {
+		return nil, errors.New("closed")
+	}
+	c := l.c
+	l.c = nil
+	return c, nil
+}
+
+func (l *oneShotListener) Close() error {
+	return nil
+}
+
+func (l *oneShotListener) Addr() net.Addr {
+	return l.c.LocalAddr()
+}
+
+// A onCloseConn implements net.Conn and calls its f on Close.
+type onCloseConn struct {
+	net.Conn
+	f func()
+}
+
+func (c *onCloseConn) Close() error {
+	if c.f != nil {
+		c.f()
+		c.f = nil
+	}
+	return c.Conn.Close()
+}
+
+func (fp *ForwardProxy) HandleTunneling8(w http.ResponseWriter, r *http.Request) {
 	print("entrou no handleTunneling")
 	print(r.UserAgent())
 	preference := getPreferenceProviderName(r.Header.Get("Planb-X-Preference-Proxy"))
@@ -188,14 +552,7 @@ func (fp *ForwardProxy) HandleTunneling(w http.ResponseWriter, r *http.Request) 
 	print("url.Host:", url.Host)
 	print("url.Host:", r.Host)
 
-	/*resp, err := fp.Send(r, reqData.Backend)
-	if err != nil {
-		print("err:", err.Error())
-	}
-
-	return resp, err*/
-
-	dest_conn, err := fp.dialer.Dial("tcp", url.Host)
+	dest_conn, err := fp.dialer.Dial("tcp", "localhost:7000")
 	if err != nil {
 		print("err:", err.Error())
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -229,10 +586,10 @@ func (fp *ForwardProxy) HandleTunneling(w http.ResponseWriter, r *http.Request) 
 	}
 	fmt.Println(string(requestDump))
 
-	err = r.Write(client_conn)
+	/*err = r.Write(client_conn)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-	}
+	}*/
 
 	errc := make(chan error, 2)
 	cp := func(dst io.Writer, src io.Reader) {
@@ -283,6 +640,7 @@ func (fp *ForwardProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
+	fmt.Println("entrou no RoundTrip")
 	for _, cookie := range req.Cookies() {
 		if cookie.Name == "planb" {
 			fmt.Println("send cookie")
@@ -296,11 +654,12 @@ func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		fmt.Errorf("error in ChooseBackend: %s", err)
 		return nil, err
 	}
-	fmt.Println("send Backend")
+	fmt.Println("send Backend: ", req.Host)
 	return fp.Send(req, reqData.Backend)
 }
 
 func (fp *ForwardProxy) Send(req *http.Request, backend string) (*http.Response, error) {
+	fmt.Println("entrou no Send with backend:", backend)
 	u, err := url.Parse(backend)
 	if err != nil {
 		fmt.Errorf("error in url.Parse: %s", err)
@@ -313,16 +672,30 @@ func (fp *ForwardProxy) Send(req *http.Request, backend string) (*http.Response,
 		}
 	}
 
-	//req.URL.Scheme = "https"
+	req.URL.Scheme = "https"
 	print("req.URL.Scheme:", req.URL.Scheme)
 	print("u.Scheme:", u.Scheme)
 
+	requestDump, err := httputil.DumpRequest(req, true)
+	if err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println(string(requestDump))
+
+	if req.URL.Host == "" {
+		req.URL.Host = req.Host
+	}
+
+	fmt.Println("antes do ProxyURL", req.Host, req.URL.Host)
 	fp.Transport.Proxy = http.ProxyURL(u)
+	fmt.Println("antes do RoundTrip")
 	rsp, err := fp.Transport.RoundTrip(req)
 	if err != nil {
 		fmt.Errorf("error in RoundTrip: %s", err)
 		return nil, err
 	}
+
+	fmt.Println("depois do RoundTrip")
 	cookie := http.Cookie{Name: "planb", Value: u.String(), Expires: time.Now().Add(5 * time.Minute)}
 	rsp.Header.Add("Set-Cookie", cookie.String())
 	return rsp, nil
@@ -341,6 +714,7 @@ func (fp *ForwardProxy) ChooseBackend(host string, preferenceProvider string) (*
 		return nil, err
 	}
 
+	fmt.Println("reqData.Backend:", reqData.Backend)
 	reqData, err = fp.Router.ChooseBackend(reqData.Backend)
 	if err != nil {
 		return nil, err

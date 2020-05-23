@@ -5,6 +5,7 @@
 package router
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -122,14 +123,19 @@ func (router *Router) ChooseBackend(host string) (*reverseproxy.RequestData, err
 	initialNumber := atomic.AddUint32(roundRobin, 1)
 	initialNumber = (initialNumber - 1) % uint32(reqData.BackendLen)
 	toUseNumber := -1
+	fmt.Println("set:", set.backends, set.dead)
 	for chosenNumber := initialNumber; ; {
+		fmt.Println("for do chosenNumber")
+		fmt.Println("set.dead[int(chosenNumber)]", set.dead[int(chosenNumber)])
 		_, isDead := set.dead[int(chosenNumber)]
 		if !isDead {
 			toUseNumber = int(chosenNumber)
+			fmt.Println("toUseNumber:", toUseNumber)
 			break
 		}
 		chosenNumber = (chosenNumber + 1) % uint32(reqData.BackendLen)
 		if chosenNumber == initialNumber {
+			fmt.Println("chosenNumber == initialNumber", chosenNumber, initialNumber)
 			break
 		}
 	}
@@ -175,6 +181,7 @@ func (router *Router) getBackends(host string) (*backendSet, error) {
 	var set backendSet
 	var err error
 	set.id, set.backends, set.dead, err = router.Backend.Backends(host)
+	fmt.Println("router.Backend.Backends(host)", host, set.id, set.backends, set.dead)
 	if err != nil {
 		if err == backend.ErrNoBackends {
 			return nil, reverseproxy.ErrNoRegisteredBackends
