@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	uuid "github.com/nu7hatch/gouuid"
+
+	"github.com/tsuru/planb/mitm"
 )
 
 type ForwardProxy struct {
@@ -21,11 +24,27 @@ type ForwardProxy struct {
 	servers []*http.Server
 	rp      *httputil.ReverseProxy
 	dialer  *net.Dialer
+
+	//mitm TLS
+	CA *tls.Certificate
+	TLSServerConfig *tls.Config
+	TLSClientConfig *tls.Config
 }
 
 func (fp *ForwardProxy) Initialize(rpConfig ReverseProxyConfig) error {
 	fp.ReverseProxyConfig = rpConfig
 	fp.servers = make([]*http.Server, 0)
+
+	ca, err := mitm.LoadCA("./certficates/mitm-ca-cert.pem", "./certficates/mitm-ca-key.pem")
+	if err!= nil {
+		panic(err.Error())
+		return err
+	}
+
+	fp.CA = &ca
+	fp.TLSServerConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
 
 	fp.dialer = &net.Dialer{
 		Timeout:   fp.DialTimeout,
@@ -70,7 +89,63 @@ func (fp *ForwardProxy) Stop() {
 }
 
 func (fp *ForwardProxy) HandleTunneling(w http.ResponseWriter, r *http.Request) {
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		http.Error(w, "no upstream", 503)
+		return
+	}
 
+	provisionalCert, err := mitm.GenCert(fp.CA, []string{host})
+	if err != nil {
+		http.Error(w, "no upstream", 503)
+		return
+	}
+
+	sConfig := new(tls.Config)
+	if fp.TLSServerConfig != nil {
+		*sConfig = *fp.TLSServerConfig
+	}
+
+	var sconn *tls.Conn
+	sConfig.Certificates = []tls.Certificate{*provisionalCert}
+	sConfig.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		cConfig := new(tls.Config)
+		if fp.TLSClientConfig != nil {
+			*cConfig = *fp.TLSClientConfig
+		}
+		cConfig.ServerName = hello.ServerName
+		sconn, err = tls.Dial("tcp", r.Host, cConfig)
+		if err != nil {
+			log.Println("dial", r.Host, err)
+			return nil, err
+		}
+		provisionalCert, err := mitm.GenCert(fp.CA, []string{host})
+		if err != nil {
+			log.Println("cert", err)
+			http.Error(w, "no upstream", 503)
+			return nil, err
+		}
+		return provisionalCert, nil
+	}
+
+	cconn, err := mitm.Handshake(w, sConfig)
+	if err != nil {
+		http.Error(w, "no handshake", 503)
+		return
+	}
+	defer cconn.Close()
+
+	if sconn == nil {
+		http.Error(w, "no sconn", 503)
+		return
+	}
+	defer sconn.Close()
+
+	ch := make(chan int)
+	wc := &mitm.OnCloseConn{cconn, func() { ch <- 0 }}
+	http.Serve(&mitm.OneShotListener{wc}, fp.rp)
+
+	<-ch
 }
 
 func (fp *ForwardProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -105,7 +180,6 @@ func (fp *ForwardProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
 	for _, cookie := range req.Cookies() {
 		if cookie.Name == "planb" {
-			fmt.Println("send cookie")
 			return fp.Send(req, cookie.Value)
 		}
 	}
@@ -116,7 +190,6 @@ func (fp *ForwardProxy) RoundTrip(req *http.Request) (*http.Response, error) {
 		fmt.Errorf("error in ChooseBackend: %s", err)
 		return nil, err
 	}
-	fmt.Println("send Backend")
 	return fp.Send(req, reqData.Backend)
 }
 
@@ -127,15 +200,13 @@ func (fp *ForwardProxy) Send(req *http.Request, backend string) (*http.Response,
 		return nil, err
 	}
 
-	for name, values := range req.Header {
-		for _, value := range values {
-			fmt.Println(name, value)
-		}
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "https"
 	}
 
-	//req.URL.Scheme = "https"
-	print("req.URL.Scheme:", req.URL.Scheme)
-	print("u.Scheme:", u.Scheme)
+	if req.URL.Host == "" {
+		req.URL.Host = req.Host
+	}
 
 	fp.Transport.Proxy = http.ProxyURL(u)
 	rsp, err := fp.Transport.RoundTrip(req)
@@ -143,6 +214,7 @@ func (fp *ForwardProxy) Send(req *http.Request, backend string) (*http.Response,
 		fmt.Errorf("error in RoundTrip: %s", err)
 		return nil, err
 	}
+	
 	cookie := http.Cookie{Name: "planb", Value: u.String(), Expires: time.Now().Add(5 * time.Minute)}
 	rsp.Header.Add("Set-Cookie", cookie.String())
 	return rsp, nil
